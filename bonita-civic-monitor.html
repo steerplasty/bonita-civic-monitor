@@ -407,6 +407,21 @@
   .empty { text-align: center; padding: 2.5rem 1rem; color: var(--muted); font-size: 14px; }
   .empty svg { width: 36px; height: 36px; color: var(--border); display: block; margin: 0 auto 0.75rem; }
 
+  .preset-btn {
+    padding: 6px 11px;
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface2);
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .preset-btn:hover { border-color: var(--accent-muted); color: var(--accent); }
+  .preset-btn.active { background: var(--accent-light); border-color: var(--accent-muted); color: var(--accent); font-weight: 500; }
+
   /* ── BUDGET METER ── */
   .budget-meter { margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid var(--border); }
   .budget-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
@@ -479,6 +494,25 @@
       <button class="src-btn" data-url="https://www.cityofbonitasprings.org/services___departments/finance_department/financial_reports" data-label="Financial Reports">
         <span class="dot"></span> Financial Reports
       </button>
+    </div>
+
+    <div class="focus-row" style="margin-top:1rem">
+      <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px">Date range — only show documents from this period</label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:140px">
+          <label for="date-from" style="font-size:12px;color:var(--muted);white-space:nowrap">From</label>
+          <input type="date" id="date-from" style="flex:1;font-size:13px;font-family:'DM Sans',sans-serif;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--text)" />
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:140px">
+          <label for="date-to" style="font-size:12px;color:var(--muted);white-space:nowrap">To</label>
+          <input type="date" id="date-to" style="flex:1;font-size:13px;font-family:'DM Sans',sans-serif;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);color:var(--text)" />
+        </div>
+        <div style="display:flex;gap:5px;flex-shrink:0">
+          <button onclick="setPreset(7)"  class="preset-btn" id="preset-7">7 days</button>
+          <button onclick="setPreset(30)" class="preset-btn" id="preset-30">30 days</button>
+          <button onclick="setPreset(90)" class="preset-btn" id="preset-90">90 days</button>
+        </div>
+      </div>
     </div>
 
     <div class="focus-row">
@@ -649,11 +683,49 @@ function getAllSources() {
 }
 
 /* ── DATE HELPERS ── */
+function fmtDate(d) {
+  return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+function fmtISO(d) {
+  return d.toISOString().split('T')[0]; // YYYY-MM-DD
+}
+function setPreset(days) {
+  const now = new Date();
+  const from = new Date(now); from.setDate(from.getDate() - days);
+  document.getElementById('date-from').value = fmtISO(from);
+  document.getElementById('date-to').value   = fmtISO(now);
+  document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+  const el = document.getElementById(`preset-${days}`);
+  if (el) el.classList.add('active');
+}
+function getSelectedRange() {
+  const fromVal = document.getElementById('date-from').value;
+  const toVal   = document.getElementById('date-to').value;
+  if (!fromVal || !toVal) return null;
+  const from = new Date(fromVal + 'T00:00:00');
+  const to   = new Date(toVal   + 'T23:59:59');
+  if (isNaN(from) || isNaN(to) || from > to) return null;
+  return { start: fmtDate(from), end: fmtDate(to), fromISO: fromVal, toISO: toVal, fromYear: from.getFullYear(), toYear: to.getFullYear() };
+}
 function getWeekRange() {
+  // Used as fallback for "This Week" button if no dates set
   const now = new Date();
   const weekAgo = new Date(now); weekAgo.setDate(weekAgo.getDate() - 7);
-  const fmt = d => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-  return { start: fmt(weekAgo), end: fmt(now), startDate: weekAgo, endDate: now };
+  return { start: fmtDate(weekAgo), end: fmtDate(now), fromISO: fmtISO(weekAgo), toISO: fmtISO(now), fromYear: now.getFullYear(), toYear: now.getFullYear() };
+}
+
+/* ── BUILD DATE CLAUSE FOR PROMPTS ── */
+// This is the key fix: we inject the year(s) directly so the web search
+// engine filters results, not just Claude's reading of them.
+function buildDateClause(range) {
+  if (!range) return '';
+  const yearStr = range.fromYear === range.toYear ? `${range.fromYear}` : `${range.fromYear} or ${range.toYear}`;
+  return `
+CRITICAL DATE FILTER: Only return documents dated between ${range.start} and ${range.end}.
+- Ignore ALL documents from before ${range.start} — do not mention them even if they appear in search results.
+- When searching, include "${yearStr} site:cityofbonitasprings.org" in your search query to help filter to recent results.
+- If a document has no clear date or appears older than ${range.start}, skip it entirely.
+- If no documents exist in this date range for a source, set found:false and say so clearly.`;
 }
 
 /* ── CLAUDE API CALL ── */
@@ -739,11 +811,16 @@ async function generateWeeklyOverall(allSummaries, range) {
 
 /* ── FETCH ONE SOURCE (used by "Scan Selected") ── */
 async function fetchSource(src, dateRange, focus) {
-  const sys = `You are a civic research assistant. Use web_search to find recent documents from the City of Bonita Springs official website. Return ONLY a JSON object (no markdown, no preamble) with this shape:
-{"found":true,"source":"label","documents":[{"title":"...","date":"...","url":"..."}],"summary":"2-3 sentence plain English summary of what recent documents cover and key decisions or topics"}`;
-  const focusClause = focus ? `\nPay special attention to: ${focus}` : '';
-  const dateClause = dateRange ? `\nFocus on documents from ${dateRange.start} to ${dateRange.end} (past 7 days).` : '';
-  const prompt = `Search for the most recent documents posted at this City of Bonita Springs page: ${src.url}\nSource: ${src.label}${dateClause}${focusClause}\n\nReturn only JSON.`;
+  const dateClause = buildDateClause(dateRange);
+  const focusClause = focus ? `\nAlso pay special attention to topics related to: ${focus}` : '';
+  const sys = `You are a civic research assistant. Use web_search to find documents from the City of Bonita Springs official website ONLY within the specified date range. You MUST ignore any document outside the date range — returning old documents wastes the user's API budget. Return ONLY a JSON object (no markdown, no preamble):
+{"found":true,"dateRange":"${dateRange ? dateRange.start+' to '+dateRange.end : 'any'}","source":"label","documents":[{"title":"...","date":"...","url":"..."}],"summary":"2-3 sentence plain English summary of only the in-range documents"}`;
+  const prompt = `Search for City of Bonita Springs documents at: ${src.url}
+Source category: ${src.label}
+${dateClause}${focusClause}
+
+Search tip: use queries like "Bonita Springs ${src.label} ${dateRange?.fromYear || ''}" to find recent results.
+Return only JSON.`;
   try {
     const raw = await askClaude(prompt, sys);
     const parsed = JSON.parse(raw);
@@ -755,22 +832,27 @@ async function fetchSource(src, dateRange, focus) {
 
 /* ── FETCH MULTIPLE SOURCES IN ONE API CALL (used by weekly scan) ── */
 async function fetchBatch(srcArray, dateRange, focus) {
-  const sys = `You are a civic research assistant. Use web_search to search for recent documents from the City of Bonita Springs official website across multiple source pages. Return ONLY a JSON array (no markdown, no preamble), one object per source, each with this shape:
-{"label":"source label","url":"source url","found":true,"documents":[{"title":"...","date":"...","url":"..."}],"summary":"2-3 sentence plain English summary"}
-Return the array even if some sources had no results (set found:false and summary to explain).`;
-  const focusClause = focus ? `\nPay special attention to: ${focus}` : '';
-  const dateClause = dateRange ? `Focus on documents from ${dateRange.start} to ${dateRange.end} (past 7 days).` : 'Find the most recent documents available.';
+  const dateClause = buildDateClause(dateRange);
+  const focusClause = focus ? `\nAlso pay special attention to topics: ${focus}` : '';
+  const sys = `You are a civic research assistant. Use web_search to find City of Bonita Springs documents ONLY within the specified date range. Returning old documents (from 2020, 2021, 2022, 2023, etc.) wastes the user's API credits — skip them entirely. Return ONLY a JSON array (no markdown, no preamble), one entry per source:
+[{"label":"...","url":"...","found":true,"documents":[{"title":"...","date":"...","url":"..."}],"summary":"2-3 sentence summary of in-range documents only"}]
+If a source has no documents in the date range, set found:false and say so.`;
   const srcList = srcArray.map(s => `- ${s.label}: ${s.url}`).join('\n');
-  const prompt = `Search for recent City of Bonita Springs government documents across these source pages:\n${srcList}\n\n${dateClause}${focusClause}\n\nUse web_search for each source. Return only a JSON array.`;
+  const prompt = `Search for City of Bonita Springs government documents across these pages:
+${srcList}
+
+${dateClause}${focusClause}
+
+Search tip: include "${dateRange?.fromYear || new Date().getFullYear()} site:cityofbonitasprings.org" in each query.
+Return only a JSON array, one object per source above.`;
   try {
     const raw = await askClaude(prompt, sys);
     const parsed = JSON.parse(raw);
-    // Ensure every source has a result, fill gaps if Claude missed any
     return srcArray.map(src => {
       const found = parsed.find(p => p.label === src.label || p.url === src.url);
       return found
         ? { ...found, label: src.label, url: src.url }
-        : { found: false, label: src.label, url: src.url, summary: 'No data returned for this source.', documents: [] };
+        : { found: false, label: src.label, url: src.url, summary: 'No documents found in the selected date range.', documents: [] };
     });
   } catch(e) {
     return srcArray.map(src => ({ found: false, label: src.label, url: src.url, summary: `Batch fetch error: ${e.message}`, documents: [] }));
@@ -832,11 +914,11 @@ function renderHistory(hist) {
 async function runWeeklyScan() {
   const key = getApiKey();
   if (!key) { alert('Please enter your Anthropic API key first (see the yellow box above).'); return; }
-  if (!checkBudgetBeforeRun(5)) return;   // 4 batch calls + 1 summary = 5
+  if (!checkBudgetBeforeRun(5)) return;
 
   const all = getAllSources();
   const focus = document.getElementById('focus-input').value.trim();
-  const range = getWeekRange();
+  const range = getSelectedRange() || getWeekRange();  // fall back to last 7 days
 
   disableBtns(true);
   document.getElementById('results-area').innerHTML = '';
@@ -892,16 +974,18 @@ async function runSelectedScan() {
   if (!sources.length) { alert('Please select at least one source.'); return; }
   if (!checkBudgetBeforeRun(sources.length)) return;
   const focus = document.getElementById('focus-input').value.trim();
+  const range = getSelectedRange();  // null = no date filter
 
   disableBtns(true);
   document.getElementById('results-area').innerHTML = '';
   document.getElementById('week-summary').classList.remove('visible');
-  setStatus(`Checking ${sources.length} selected source${sources.length > 1 ? 's' : ''}...`);
+  const rangeLabel = range ? `${range.start} – ${range.end}` : 'most recent';
+  setStatus(`Checking ${sources.length} selected source${sources.length > 1 ? 's' : ''} (${rangeLabel})...`);
 
   const results = [];
   for (let i = 0; i < sources.length; i++) {
     setStatus(`[${i+1}/${sources.length}] Searching: ${sources[i].label}...`);
-    const r = await fetchSource(sources[i], null, focus);
+    const r = await fetchSource(sources[i], range, focus);
     results.push(r);
   }
 
@@ -922,6 +1006,7 @@ async function runSelectedScan() {
 initApiKey();
 loadHistory();
 updateBudgetUI();
+setPreset(7);  // default to last 7 days
 </script>
 </body>
 </html>
